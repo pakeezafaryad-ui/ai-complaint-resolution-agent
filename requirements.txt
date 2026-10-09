@@ -4,3 +4,4 @@ pandas
 crewai[litellm]
 groq
 litellm==1.104.2
+resend
