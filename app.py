@@ -2,13 +2,15 @@
 import os
 import json
 import uuid
+import smtplib
+import ssl
+from email.message import EmailMessage
 from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
 
-# Work around CrewAI adding an unsupported cache_breakpoint
-# field to requests sent to providers such as Groq.
+# Workaround for the unsupported cache_breakpoint field.
 try:
     import crewai.llms.cache as crew_cache
     crew_cache.mark_cache_breakpoint = lambda msg: msg
@@ -45,11 +47,109 @@ def initialize_storage():
             json.dump([], f, indent=4)
 
 
-def get_api_key():
+def get_secret(name, default=""):
     try:
-        return st.secrets["GROQ_API_KEY"]
-    except (KeyError, FileNotFoundError):
-        return os.getenv("GROQ_API_KEY", "")
+        return str(st.secrets.get(name, default)).strip()
+    except Exception:
+        return os.getenv(name, default).strip()
+
+
+def get_api_key():
+    return get_secret("GROQ_API_KEY")
+
+
+def send_email(to_email, subject, body):
+    """Send an email through Gmail SMTP."""
+    sender = get_secret("SMTP_EMAIL")
+    password = get_secret("SMTP_APP_PASSWORD")
+
+    if not sender or not password:
+        raise ValueError(
+            "SMTP_EMAIL or SMTP_APP_PASSWORD is missing in Streamlit Secrets."
+        )
+
+    message = EmailMessage()
+    message["From"] = sender
+    message["To"] = to_email
+    message["Subject"] = subject
+    message.set_content(body)
+
+    context = ssl.create_default_context()
+
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=25) as server:
+        server.ehlo()
+        server.starttls(context=context)
+        server.ehlo()
+        server.login(sender, password)
+        server.send_message(message)
+
+
+def send_complaint_emails(name, email, subject, complaint_text, complaint_id):
+    """Try customer confirmation and admin notification independently."""
+    results = {}
+
+    customer_body = f"""Hello {name},
+
+Thank you for contacting us. Your complaint has been received.
+
+Complaint ID: {complaint_id}
+Subject: {subject}
+Status: Awaiting human review
+
+Our team will review your complaint. This message confirms receipt only;
+it does not mean that the complaint has already been resolved.
+
+Please keep your complaint ID for reference.
+
+Regards,
+Customer Support
+AI Complaint Resolution Agent
+"""
+
+    try:
+        send_email(
+            email,
+            f"Complaint received: {complaint_id}",
+            customer_body
+        )
+        results["customer"] = True
+    except Exception as exc:
+        results["customer"] = False
+        results["customer_error"] = f"{type(exc).__name__}: {exc}"
+
+    admin_email = get_secret("ADMIN_EMAIL")
+
+    if not admin_email:
+        results["admin"] = False
+        results["admin_error"] = "ADMIN_EMAIL is missing in Streamlit Secrets."
+    else:
+        admin_body = f"""A new complaint has been processed.
+
+Complaint ID: {complaint_id}
+Customer name: {name}
+Customer email: {email}
+Subject: {subject}
+
+Complaint description:
+{complaint_text}
+
+Status: Awaiting human review
+
+Please review the complaint and the AI analysis in the application.
+The AI recommendation should be checked by a human before any action.
+"""
+        try:
+            send_email(
+                admin_email,
+                f"New complaint: {complaint_id}",
+                admin_body
+            )
+            results["admin"] = True
+        except Exception as exc:
+            results["admin"] = False
+            results["admin_error"] = f"{type(exc).__name__}: {exc}"
+
+    return results
 
 
 def process_complaint(name, email, subject, complaint_text, api_key):
@@ -80,10 +180,7 @@ def process_complaint(name, email, subject, complaint_text, api_key):
     resolution_agent = Agent(
         role="Resolution Specialist",
         goal="Recommend a solution and draft a professional reply.",
-        backstory=(
-            "You are empathetic and never promise "
-            "unauthorized outcomes."
-        ),
+        backstory="You are empathetic and never promise unauthorized outcomes.",
         llm=llm,
         verbose=False,
         allow_delegation=False
@@ -130,9 +227,7 @@ Complaint: {complaint_text}
 Use the earlier findings. Do not promise unauthorized refunds.
 Do not send an email. The reply is a draft for human approval.
 """,
-        expected_output=(
-            "Proposed resolution, reply draft, and review advice."
-        ),
+        expected_output="Proposed resolution, reply draft, and review advice.",
         agent=resolution_agent,
         context=[task1, task2]
     )
@@ -166,6 +261,7 @@ Do not send an email. The reply is a draft for human approval.
     }
 
     df = pd.read_csv(CSV_PATH)
+
     for col in COLUMNS:
         if col not in df.columns:
             df[col] = ""
@@ -207,7 +303,8 @@ with submit_tab:
         email = st.text_input("Your email address")
         subject = st.text_input("Complaint subject")
         complaint_text = st.text_area(
-            "Describe your complaint", height=150
+            "Describe your complaint",
+            height=150
         )
         submitted = st.form_submit_button("Submit Complaint")
 
@@ -228,9 +325,7 @@ with submit_tab:
                     "GROQ_API_KEY in Streamlit Secrets."
                 )
             else:
-                with st.spinner(
-                    "AI agents are analyzing your complaint..."
-                ):
+                with st.spinner("AI agents are analyzing your complaint..."):
                     try:
                         complaint_id, result = process_complaint(
                             name.strip(),
@@ -239,13 +334,57 @@ with submit_tab:
                             complaint_text.strip(),
                             api_key
                         )
-                        st.success("Complaint recorded successfully!")
+
+                        st.success("Complaint processed and recorded!")
                         st.subheader(f"Complaint ID: {complaint_id}")
                         st.info(
-                            "Awaiting human review. No email has been sent."
+                            "Your complaint is awaiting human review. "
+                            "No resolution has been automatically approved."
                         )
                         st.subheader("AI Analysis")
                         st.write(result)
+
+                        with st.spinner("Sending email notifications..."):
+                            email_results = send_complaint_emails(
+                                name.strip(),
+                                email.strip(),
+                                subject.strip(),
+                                complaint_text.strip(),
+                                complaint_id
+                            )
+
+                        if email_results.get("customer"):
+                            st.success(
+                                f"Confirmation email sent to {email.strip()}."
+                            )
+                        else:
+                            st.warning(
+                                "The complaint was saved, but the customer "
+                                "confirmation email could not be sent."
+                            )
+                            st.caption(
+                                "Customer email error: "
+                                + email_results.get(
+                                    "customer_error", "Unknown error"
+                                )
+                            )
+
+                        if email_results.get("admin"):
+                            st.success(
+                                "Admin notification sent successfully."
+                            )
+                        else:
+                            st.warning(
+                                "The complaint was saved, but the admin "
+                                "notification could not be sent."
+                            )
+                            st.caption(
+                                "Admin email error: "
+                                + email_results.get(
+                                    "admin_error", "Unknown error"
+                                )
+                            )
+
                     except Exception as exc:
                         st.error(
                             "Unable to process the complaint. "
@@ -276,6 +415,7 @@ with dashboard_tab:
             )
 
             search = st.text_input("Search complaints")
+
             if search:
                 mask = df.astype(str).apply(
                     lambda col: col.str.contains(
@@ -303,10 +443,11 @@ with dashboard_tab:
                 file_name="complaints.csv",
                 mime="text/csv"
             )
+
     except Exception:
         st.error("Unable to load complaint records.")
 
 st.caption(
-    "AI recommendations require review. Do not submit passwords "
+    "AI recommendations require human review. Do not submit passwords "
     "or other highly sensitive personal information."
 )
