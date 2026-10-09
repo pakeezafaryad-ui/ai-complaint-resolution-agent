@@ -1,5 +1,6 @@
+
 streamlit
 pandas
 crewai[litellm]
 groq
-litellm
+litellm==1.104.2
